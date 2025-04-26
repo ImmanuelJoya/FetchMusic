@@ -1,0 +1,26 @@
+.App {
+  text-align: center;
+  padding: 20px;
+}
+
+form {
+  margin: 20px 0;
+}
+
+button {
+  padding: 10px 20px;
+  margin-left: 10px;
+  background-color: #ff0000;
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+button:hover {
+  background-color: #cc0000;
+}
+
+img {
+  margin-top: 10px;
+  max-width: 200px;
+}
