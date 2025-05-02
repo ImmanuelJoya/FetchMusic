@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from googleapiclient.discovery import build
-import requests
 import yt_dlp
 import os
 from dotenv import load_dotenv
+from mangum import Mangum
+import io
 
 load_dotenv()
 
@@ -14,15 +15,15 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],  # Update to your frontend domain (e.g., "https://your-frontend.vercel.app") for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.mount("/downloads", StaticFiles(directory="downloads"), name="downloads")
+# Remove static file mounting (not supported in Vercel)
+# app.mount("/downloads", StaticFiles(directory="downloads"), name="downloads")
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # Initialize YouTube Data API client (or None if key is missing)
@@ -45,7 +46,7 @@ class Metadata(BaseModel):
 
 class ProcessResponse(BaseModel):
     metadata: Metadata
-    download_url: str | None
+    download_available: bool  # Changed from download_url to indicate availability
 
 @app.get("/")
 async def root():
@@ -59,100 +60,116 @@ async def favicon():
 async def process_link(link: MusicLink):
     try:
         # Extract video ID
-        video_id = link.url.split("v=")[1].split("&")[0] if "watch?v=" in link.url else link.url.split("/")[-1]
+        if "watch?v=" in link.url:
+            video_id = link.url.split("v=")[1].split("&")[0] if "&" in link.url else link.url.split("v=")[1]
+            video_id = video_id.split("?")[0]
+        else:
+            video_id = link.url.split("/")[-1].split("?")[0]
 
-        # Fetch metadata using the YouTube RapidAPI endpoint
-        metadata_url = "https://youtube138.p.rapidapi.com/video/details"
-        headers = {
-            "X-RapidAPI-Key": RAPIDAPI_KEY,
-            "X-RapidAPI-Host": "youtube138.p.rapidapi.com",
-        }
-        params = {"id": video_id}
-        response = requests.get(metadata_url, headers=headers, params=params)
-        print(f"RapidAPI Metadata Response Status: {response.status_code}")
-        print(f"RapidAPI Metadata Response Body: {response.text}")
-        response.raise_for_status()
-        result = response.json()
+        # Fetch metadata using YouTube Data API (replacing RapidAPI for reliability)
+        if not youtube:
+            raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY.")
+        
+        request = youtube.videos().list(part="snippet,contentDetails", id=video_id)
+        response = request.execute()
+        if not response["items"]:
+            raise HTTPException(status_code=404, detail="Video not found")
+        video = response["items"][0]
 
-        # Extract metadata
-        author = result.get("author", {})
-        channel_name = author.get("title", "Unknown Channel") if isinstance(author, dict) else "Unknown Channel"
-
-        description = result.get("description", "")
+        description = video["snippet"]["description"]
         album = None
         for line in description.split("\n"):
             if "Album:" in line:
                 album = line.split("Album:")[1].strip()
                 break
 
-        thumbnails = result.get("thumbnails", [])
-        thumbnail_url = None
-        if thumbnails:
-            if isinstance(thumbnails, list):
-                thumbnail_url = thumbnails[0].get("url") if thumbnails else None
-            elif isinstance(thumbnails, dict):
-                thumbnail_url = thumbnails.get("high", {}).get("url")
-
-        duration = result.get("lengthSeconds") or result.get("duration")
+        # Parse duration (ISO 8601 format, e.g., PT3M33S)
+        duration = video["contentDetails"]["duration"]
         if duration:
-            duration = int(duration)
-            minutes = duration // 60
-            seconds = duration % 60
+            duration = duration.replace("PT", "").replace("S", "")
+            minutes = 0
+            if "M" in duration:
+                minutes = int(duration.split("M")[0])
+                seconds = int(duration.split("M")[1]) if duration.split("M")[1] else 0
+            else:
+                seconds = int(duration)
             duration = f"{minutes}:{seconds:02d}"
 
         metadata = Metadata(
-            title=result.get("title", "Unknown Title"),
-            channel=channel_name,
+            title=video["snippet"]["title"],
+            channel=video["snippet"]["channelTitle"],
             duration=duration,
-            thumbnail=thumbnail_url,
+            thumbnail=video["snippet"]["thumbnails"].get("high", {}).get("url"),
             album=album
         )
 
-        # Check licensing using YouTube Data API (if available)
-        download_url = None
-        is_downloadable = False  # Default to false if YouTube Data API is unavailable
-        if youtube:
-            try:
-                request = youtube.videos().list(part="contentDetails,snippet", id=video_id)
-                response = request.execute()
-                if not response["items"]:
-                    raise HTTPException(status_code=404, detail="Video not found")
-                video = response["items"][0]
-                licensed_content = video["contentDetails"]["licensedContent"]
-                description_lower = video["snippet"]["description"].lower()
-                is_downloadable = not licensed_content or "creative commons" in description_lower
-            except Exception as yt_e:
-                print(f"YouTube Data API Error: {str(yt_e)}")
+        # Check licensing using YouTube Data API
+        licensed_content = video["contentDetails"]["licensedContent"]
+        description_lower = video["snippet"]["description"].lower()
+        is_downloadable = not licensed_content or "creative commons" in description_lower
 
-        if is_downloadable:
-            # Try to fetch download URL using the YouTube RapidAPI endpoint
-            try:
-                download_api_url = "https://youtube138.p.rapidapi.com/video/download"
-                response = requests.get(download_api_url, headers=headers, params=params)
-                print(f"RapidAPI Download Response Status: {response.status_code}")
-                print(f"RapidAPI Download Response Body: {response.text}")
-                response.raise_for_status()
-                download_result = response.json()
-                download_url = download_result.get("download_url")
-            except Exception as e:
-                print(f"RapidAPI Download Error: {str(e)}")
-                # Fallback to yt-dlp
-                try:
-                    ydl_opts = {
-                        "format": "bestaudio",
-                        "extract_audio": True,
-                        "audio_format": "mp3",
-                        "outtmpl": f"downloads/{video_id}.mp3",
-                        "quiet": True,
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([link.url])
-                    download_url = f"http://localhost:8000/downloads/{video_id}.mp3"
-                except Exception as dl_e:
-                    print(f"yt-dlp Error: {str(dl_e)}")
-
-        return ProcessResponse(metadata=metadata, download_url=download_url)
+        return ProcessResponse(metadata=metadata, download_available=is_downloadable)
     except Exception as e:
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+@app.post("/download")
+async def download(link: MusicLink):
+    try:
+        if not youtube:
+            raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY.")
+
+        # Extract video ID
+        if "watch?v=" in link.url:
+            video_id = link.url.split("v=")[1].split("&")[0] if "&" in link.url else link.url.split("v=")[1]
+            video_id = video_id.split("?")[0]
+        else:
+            video_id = link.url.split("/")[-1].split("?")[0]
+
+        # Verify licensing
+        request = youtube.videos().list(part="contentDetails,snippet", id=video_id)
+        response = request.execute()
+        if not response["items"]:
+            raise HTTPException(status_code=404, detail="Video not found")
+        video = response["items"][0]
+
+        licensed_content = video["contentDetails"]["licensedContent"]
+        description_lower = video["snippet"]["description"].lower()
+        is_downloadable = not licensed_content or "creative commons" in description_lower
+
+        if not is_downloadable:
+            raise HTTPException(status_code=403, detail="Video is not licensed for download.")
+
+        # Download with yt-dlp
+        os.makedirs("downloads", exist_ok=True)
+        file_path = f"downloads/{video_id}.mp3"
+        ydl_opts = {
+            "format": "bestaudio[filesize<10M]",  # Limit to 10MB to stay within Vercel limits
+            "extract_audio": True,
+            "audio_format": "mp3",
+            "outtmpl": file_path,
+            "quiet": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([link.url])
+
+        # Stream the file
+        def iterfile():
+            with open(file_path, "rb") as file:
+                yield from file
+            os.remove(file_path)  # Clean up after streaming
+
+        return StreamingResponse(
+            iterfile(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f"attachment; filename={video_id}.mp3"}
+        )
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Vercel serverless handler
+handler = Mangum(app)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
