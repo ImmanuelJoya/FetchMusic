@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import requests
+from googleapiclient.discovery import build
 import yt_dlp
 import os
 from dotenv import load_dotenv
@@ -26,7 +26,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+# Initialize YouTube Data API client without failing at startup
+youtube = None
+if YOUTUBE_API_KEY:
+    try:
+        youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+        logger.info("YouTube Data API client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize YouTube Data API client: {str(e)}")
+else:
+    logger.warning("YOUTUBE_API_KEY environment variable is missing. API-dependent endpoints will fail.")
 
 class MusicLink(BaseModel):
     url: str
@@ -52,9 +63,12 @@ async def favicon():
 
 @app.post("/process-link", response_model=ProcessResponse)
 async def process_link(link: MusicLink):
-    if not RAPIDAPI_KEY:
-        logger.error("RAPIDAPI_KEY is missing during request.")
-        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY environment variable is missing.")
+    if not YOUTUBE_API_KEY:
+        logger.error("YOUTUBE_API_KEY is missing during request.")
+        raise HTTPException(status_code=500, detail="YOUTUBE_API_KEY environment variable is missing.")
+    if not youtube:
+        logger.error("YouTube Data API client not initialized.")
+        raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY validity.")
 
     try:
         # Extract video ID
@@ -64,57 +78,46 @@ async def process_link(link: MusicLink):
         else:
             video_id = link.url.split("/")[-1].split("?")[0]
 
-        # Fetch metadata using RapidAPI
-        metadata_url = "https://youtube138.p.rapidapi.com/video/details"
-        headers = {
-            "X-RapidAPI-Key": RAPIDAPI_KEY,
-            "X-RapidAPI-Host": "youtube138.p.rapidapi.com",
-        }
-        params = {"id": video_id}
-        response = requests.get(metadata_url, headers=headers, params=params)
-        logger.info(f"RapidAPI Metadata Response Status: {response.status_code}")
-        response.raise_for_status()
-        result = response.json()
+        # Fetch metadata using YouTube Data API
+        request = youtube.videos().list(part="snippet,contentDetails", id=video_id)
+        response = request.execute()
+        if not response["items"]:
+            raise HTTPException(status_code=404, detail="Video not found")
+        video = response["items"][0]
 
-        # Extract metadata
-        author = result.get("author", {})
-        channel_name = author.get("title", "Unknown Channel") if isinstance(author, dict) else "Unknown Channel"
-
-        description = result.get("description", "")
+        description = video["snippet"]["description"]
         album = None
         for line in description.split("\n"):
             if "Album:" in line:
                 album = line.split("Album:")[1].strip()
                 break
 
-        thumbnails = result.get("thumbnails", [])
-        thumbnail_url = None
-        if thumbnails:
-            if isinstance(thumbnails, list):
-                thumbnail_url = thumbnails[0].get("url") if thumbnails else None
-            elif isinstance(thumbnails, dict):
-                thumbnail_url = thumbnails.get("high", {}).get("url")
-
-        duration = result.get("lengthSeconds")
+        # Parse duration (ISO 8601 format, e.g., PT3M33S)
+        duration = video["contentDetails"]["duration"]
         if duration:
-            duration = int(duration)
-            minutes = duration // 60
-            seconds = duration % 60
+            duration = duration.replace("PT", "").replace("S", "")
+            minutes = 0
+            if "M" in duration:
+                minutes = int(duration.split("M")[0])
+                seconds = int(duration.split("M")[1]) if duration.split("M")[1] else 0
+            else:
+                seconds = int(duration)
             duration = f"{minutes}:{seconds:02d}"
 
         metadata = Metadata(
-            title=result.get("title", "Unknown Title"),
-            channel=channel_name,
+            title=video["snippet"]["title"],
+            channel=video["snippet"]["channelTitle"],
             duration=duration,
-            thumbnail=thumbnail_url,
+            thumbnail=video["snippet"]["thumbnails"].get("high", {}).get("url"),
             album=album
         )
 
-        # Assume download availability (RapidAPI doesn't provide licensing info)
-        # We'll rely on yt-dlp for actual download checks
-        download_available = True  # Placeholder; refine based on needs
+        # Check licensing using YouTube Data API
+        licensed_content = video["contentDetails"]["licensedContent"]
+        description_lower = video["snippet"]["description"].lower()
+        is_downloadable = not licensed_content or "creative commons" in description_lower
 
-        return ProcessResponse(metadata=metadata, download_available=download_available)
+        return ProcessResponse(metadata=metadata, download_available=is_downloadable)
     except HTTPException as e:
         raise e
     except Exception as e:
@@ -123,9 +126,12 @@ async def process_link(link: MusicLink):
 
 @app.post("/download")
 async def download(link: MusicLink):
-    if not RAPIDAPI_KEY:
-        logger.error("RAPIDAPI_KEY is missing during download request.")
-        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY environment variable is missing.")
+    if not YOUTUBE_API_KEY:
+        logger.error("YOUTUBE_API_KEY is missing during download request.")
+        raise HTTPException(status_code=500, detail="YOUTUBE_API_KEY environment variable is missing.")
+    if not youtube:
+        logger.error("YouTube Data API client not initialized during download.")
+        raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY validity.")
 
     try:
         # Extract video ID
@@ -134,6 +140,20 @@ async def download(link: MusicLink):
             video_id = video_id.split("?")[0]
         else:
             video_id = link.url.split("/")[-1].split("?")[0]
+
+        # Verify licensing
+        request = youtube.videos().list(part="contentDetails,snippet", id=video_id)
+        response = request.execute()
+        if not response["items"]:
+            raise HTTPException(status_code=404, detail="Video not found")
+        video = response["items"][0]
+
+        licensed_content = video["contentDetails"]["licensedContent"]
+        description_lower = video["snippet"]["description"].lower()
+        is_downloadable = not licensed_content or "creative commons" in description_lower
+
+        if not is_downloadable:
+            raise HTTPException(status_code=403, detail="Video is not licensed for download.")
 
         # Download with yt-dlp
         os.makedirs("downloads", exist_ok=True)
