@@ -2,12 +2,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from googleapiclient.discovery import build
+import requests
 import yt_dlp
 import os
 from dotenv import load_dotenv
 from mangum import Mangum
 import io
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -15,24 +20,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to your frontend domain (e.g., "https://your-frontend.vercel.app") for production
+    allow_origins=["*"],  # Update to your frontend domain for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Remove static file mounting (not supported in Vercel)
-# app.mount("/downloads", StaticFiles(directory="downloads"), name="downloads")
-
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-
-# Initialize YouTube Data API client (or None if key is missing)
-youtube = None
-if YOUTUBE_API_KEY:
-    try:
-        youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-    except Exception as e:
-        print(f"Failed to initialize YouTube Data API client: {str(e)}")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 
 class MusicLink(BaseModel):
     url: str
@@ -46,7 +40,7 @@ class Metadata(BaseModel):
 
 class ProcessResponse(BaseModel):
     metadata: Metadata
-    download_available: bool  # Changed from download_url to indicate availability
+    download_available: bool
 
 @app.get("/")
 async def root():
@@ -58,6 +52,10 @@ async def favicon():
 
 @app.post("/process-link", response_model=ProcessResponse)
 async def process_link(link: MusicLink):
+    if not RAPIDAPI_KEY:
+        logger.error("RAPIDAPI_KEY is missing during request.")
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY environment variable is missing.")
+
     try:
         # Extract video ID
         if "watch?v=" in link.url:
@@ -66,59 +64,70 @@ async def process_link(link: MusicLink):
         else:
             video_id = link.url.split("/")[-1].split("?")[0]
 
-        # Fetch metadata using YouTube Data API (replacing RapidAPI for reliability)
-        if not youtube:
-            raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY.")
-        
-        request = youtube.videos().list(part="snippet,contentDetails", id=video_id)
-        response = request.execute()
-        if not response["items"]:
-            raise HTTPException(status_code=404, detail="Video not found")
-        video = response["items"][0]
+        # Fetch metadata using RapidAPI
+        metadata_url = "https://youtube138.p.rapidapi.com/video/details"
+        headers = {
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": "youtube138.p.rapidapi.com",
+        }
+        params = {"id": video_id}
+        response = requests.get(metadata_url, headers=headers, params=params)
+        logger.info(f"RapidAPI Metadata Response Status: {response.status_code}")
+        response.raise_for_status()
+        result = response.json()
 
-        description = video["snippet"]["description"]
+        # Extract metadata
+        author = result.get("author", {})
+        channel_name = author.get("title", "Unknown Channel") if isinstance(author, dict) else "Unknown Channel"
+
+        description = result.get("description", "")
         album = None
         for line in description.split("\n"):
             if "Album:" in line:
                 album = line.split("Album:")[1].strip()
                 break
 
-        # Parse duration (ISO 8601 format, e.g., PT3M33S)
-        duration = video["contentDetails"]["duration"]
+        thumbnails = result.get("thumbnails", [])
+        thumbnail_url = None
+        if thumbnails:
+            if isinstance(thumbnails, list):
+                thumbnail_url = thumbnails[0].get("url") if thumbnails else None
+            elif isinstance(thumbnails, dict):
+                thumbnail_url = thumbnails.get("high", {}).get("url")
+
+        duration = result.get("lengthSeconds")
         if duration:
-            duration = duration.replace("PT", "").replace("S", "")
-            minutes = 0
-            if "M" in duration:
-                minutes = int(duration.split("M")[0])
-                seconds = int(duration.split("M")[1]) if duration.split("M")[1] else 0
-            else:
-                seconds = int(duration)
+            duration = int(duration)
+            minutes = duration // 60
+            seconds = duration % 60
             duration = f"{minutes}:{seconds:02d}"
 
         metadata = Metadata(
-            title=video["snippet"]["title"],
-            channel=video["snippet"]["channelTitle"],
+            title=result.get("title", "Unknown Title"),
+            channel=channel_name,
             duration=duration,
-            thumbnail=video["snippet"]["thumbnails"].get("high", {}).get("url"),
+            thumbnail=thumbnail_url,
             album=album
         )
 
-        # Check licensing using YouTube Data API
-        licensed_content = video["contentDetails"]["licensedContent"]
-        description_lower = video["snippet"]["description"].lower()
-        is_downloadable = not licensed_content or "creative commons" in description_lower
+        # Assume download availability (RapidAPI doesn't provide licensing info)
+        # We'll rely on yt-dlp for actual download checks
+        download_available = True  # Placeholder; refine based on needs
 
-        return ProcessResponse(metadata=metadata, download_available=is_downloadable)
+        return ProcessResponse(metadata=metadata, download_available=download_available)
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Error processing link: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error processing request: {str(e)}")
 
 @app.post("/download")
 async def download(link: MusicLink):
-    try:
-        if not youtube:
-            raise HTTPException(status_code=500, detail="YouTube Data API client not initialized. Please check YOUTUBE_API_KEY.")
+    if not RAPIDAPI_KEY:
+        logger.error("RAPIDAPI_KEY is missing during download request.")
+        raise HTTPException(status_code=500, detail="RAPIDAPI_KEY environment variable is missing.")
 
+    try:
         # Extract video ID
         if "watch?v=" in link.url:
             video_id = link.url.split("v=")[1].split("&")[0] if "&" in link.url else link.url.split("v=")[1]
@@ -126,25 +135,11 @@ async def download(link: MusicLink):
         else:
             video_id = link.url.split("/")[-1].split("?")[0]
 
-        # Verify licensing
-        request = youtube.videos().list(part="contentDetails,snippet", id=video_id)
-        response = request.execute()
-        if not response["items"]:
-            raise HTTPException(status_code=404, detail="Video not found")
-        video = response["items"][0]
-
-        licensed_content = video["contentDetails"]["licensedContent"]
-        description_lower = video["snippet"]["description"].lower()
-        is_downloadable = not licensed_content or "creative commons" in description_lower
-
-        if not is_downloadable:
-            raise HTTPException(status_code=403, detail="Video is not licensed for download.")
-
         # Download with yt-dlp
         os.makedirs("downloads", exist_ok=True)
         file_path = f"downloads/{video_id}.mp3"
         ydl_opts = {
-            "format": "bestaudio[filesize<10M]",  # Limit to 10MB to stay within Vercel limits
+            "format": "bestaudio[filesize<10M]",
             "extract_audio": True,
             "audio_format": "mp3",
             "outtmpl": file_path,
@@ -164,9 +159,11 @@ async def download(link: MusicLink):
             media_type="audio/mpeg",
             headers={"Content-Disposition": f"attachment; filename={video_id}.mp3"}
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Error downloading file: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error downloading file: {str(e)}")
 
 # Vercel serverless handler
 handler = Mangum(app)
