@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
 app = FastAPI()
+
+@app.get("/debug-env")
+async def debug_env():
+    import os
+    return {"YOUTUBE_API_KEY": os.getenv("YOUTUBE_API_KEY")}
 
 app.add_middleware(
     CORSMiddleware,
